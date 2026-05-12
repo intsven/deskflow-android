@@ -75,6 +75,7 @@ import org.tfv.deskflow.client.models.ClipboardData
 import org.tfv.deskflow.client.util.Keyboard
 import org.tfv.deskflow.client.util.logging.KLoggingManager
 import org.tfv.deskflow.components.GlobalKeyboardManager
+import org.tfv.deskflow.ext.ScreenSize
 import org.tfv.deskflow.ext.canDrawOverlays
 import org.tfv.deskflow.ext.getScreenSize
 import org.tfv.deskflow.ext.sendServiceConnectionEvent
@@ -215,6 +216,25 @@ class GlobalInputService : AccessibilityService() {
   @Volatile private var activeDisplayId: Int = android.view.Display.DEFAULT_DISPLAY
 
   /**
+   * Cached screen size for the active display.
+   * Caching this prevents expensive IPC calls during high-frequency events like mouse movement.
+   */
+  @Volatile private var cachedScreenSize: ScreenSize? = null
+
+  /**
+   * Update the cached screen size for the current active display.
+   */
+  private fun updateCachedScreenSize() {
+    try {
+        val size = getScreenSize(activeDisplayId)
+        cachedScreenSize = size
+        log.info { "Updated cached screen size: ${size.px.width}x${size.px.height} for display $activeDisplayId" }
+    } catch (e: Exception) {
+        log.error(e) { "Failed to update cached screen size for display $activeDisplayId" }
+    }
+  }
+
+  /**
    * Tracks the current mouse button state for drag detection.
    * Stores button ID and the position where the button was pressed.
    */
@@ -333,7 +353,10 @@ class GlobalInputService : AccessibilityService() {
 
     override fun onDisplayChanged(displayId: Int) {
       log.debug { "Display changed: ID=$displayId" }
-      // Don't need to do anything for simple display changes like brightness
+      // Update cache if the active display changed (e.g. rotation)
+      if (displayId == activeDisplayId) {
+        updateCachedScreenSize()
+      }
     }
   }
 
@@ -738,7 +761,8 @@ class GlobalInputService : AccessibilityService() {
       return
     }
 
-    val newScreenSize = getScreenSize(activeDisplayId)
+    updateCachedScreenSize()
+    val newScreenSize = cachedScreenSize ?: getScreenSize(activeDisplayId)
     log.info { "Configuration changed - new screen size: ${newScreenSize.px.width}x${newScreenSize.px.height}, density: ${newScreenSize.scale}" }
 
     // Skip updating if screen size is invalid (can happen during rotation transitions)
@@ -1204,10 +1228,6 @@ class GlobalInputService : AccessibilityService() {
   private fun moveMousePointer(x: Int, y: Int) {
     if (!mousePointerVisible) return
 
-    val screenSize = getScreenSize(activeDisplayId)
-    log.debug {
-      "Cursor move to [${x}, ${y}] with size(${screenSize.px.width},${screenSize.px.height})"
-    }
     mousePointerLayout.x = x
     mousePointerLayout.y = y
 
@@ -1418,7 +1438,7 @@ class GlobalInputService : AccessibilityService() {
    * Creates a two-finger gesture that spreads apart to simulate zoom in.
    */
   private fun spreadGesture() {
-    val screenSize = getScreenSize(activeDisplayId)
+    val screenSize = cachedScreenSize ?: getScreenSize(activeDisplayId)
     val pointerX = mousePointerLayout.x.toFloat()
     val pointerY = mousePointerLayout.y.toFloat()
 
@@ -1476,7 +1496,7 @@ class GlobalInputService : AccessibilityService() {
    * Uses willContinue=true to hold at the pinch point, then releases on completion callback.
    */
   private fun pinchGesture() {
-    val screenSize = getScreenSize(activeDisplayId)
+    val screenSize = cachedScreenSize ?: getScreenSize(activeDisplayId)
     val pointerX = mousePointerLayout.x.toFloat()
     val pointerY = mousePointerLayout.y.toFloat()
 
@@ -1542,7 +1562,7 @@ class GlobalInputService : AccessibilityService() {
 
     globalInputPending = true
 
-    val screenSize = getScreenSize(activeDisplayId)
+    val screenSize = cachedScreenSize ?: getScreenSize(activeDisplayId)
     val screenHeight = screenSize.px.height.toFloat()
 
     // Use pointer position as center of swipe
@@ -1634,6 +1654,7 @@ class GlobalInputService : AccessibilityService() {
 
       // Update active display ID for gesture dispatching
       activeDisplayId = activeDisplay.displayId
+      updateCachedScreenSize()
 
       log.debug { "Reinitialized WindowManager for display ID: ${activeDisplay.displayId}" }
 
@@ -1846,8 +1867,11 @@ class GlobalInputService : AccessibilityService() {
     activeDisplayId = activeDisplay.displayId
     log.info { "Initialized WindowManager for display ID: $activeDisplayId" }
 
+    // Initialize cached screen size
+    updateCachedScreenSize()
+    val screenSize = cachedScreenSize ?: getScreenSize(activeDisplayId)
+
     // Update screen dimensions to ConnectionService now that we know the active display
-    val screenSize = getScreenSize(activeDisplayId)
     val result = serviceClient.updateScreenDimensions(screenSize.px.width, screenSize.px.height)
     if (result?.ok == true) {
       log.info { "Successfully initialized server with screen dimensions: ${screenSize.px.width}x${screenSize.px.height} for display $activeDisplayId" }
