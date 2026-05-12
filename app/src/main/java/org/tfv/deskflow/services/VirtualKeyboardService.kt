@@ -482,11 +482,13 @@ class VirtualKeyboardService : InputMethodService() {
     }
 
     // 2. Check if the keyboard view lifecycle is started.
+    // Relaxed check: as long as we have an InputConnection and lifecycle is at least CREATED, 
+    // we should try to process keys. Some devices might not trigger RESUMED for IME.
     if (
       keyboardViewLifecycleOwner.lifecycle.currentState <
-        Lifecycle.State.RESUMED
+        Lifecycle.State.CREATED
     ) {
-      log.warn { "Lifecycle is not started, ignoring event: $event" }
+      log.warn { "Lifecycle is not created (${keyboardViewLifecycleOwner.lifecycle.currentState}), ignoring event: $event" }
       return
     }
 
@@ -568,11 +570,24 @@ class VirtualKeyboardService : InputMethodService() {
       // Regular character input (including terminal apps where ExtractedText is null)
       else -> {
         log.debug { "Received $event" }
-        val keyChar = id.toChar()
-        val keyStr = keyChar.toString()
+
+        // Deskflow/X11 keysym to character mapping
+        val keyStr = when {
+          // Latin-1 range (0x0020 to 0x00FF)
+          id in 0x20..0xFF -> id.toChar().toString()
+          // Unicode range (0x01000000 to 0x0100FFFF)
+          id.toUInt() in 0x01000000u..0x0100FFFFu -> (id.toUInt() and 0xFFFFu).toInt().toChar().toString()
+          else -> null
+        }
+
+        if (keyStr == null) {
+          log.warn { "Could not map keysym 0x${event.id.toString(16)} to character" }
+          return
+        }
 
         // Terminal apps: Handle Ctrl+A-Z as ASCII control characters
         if (et == null && mods.isControl && !mods.isAlt && !mods.isMeta && !mods.isSuper) {
+          val keyChar = keyStr[0]
           val upperChar = keyChar.uppercaseChar()
           if (upperChar in 'A'..'Z') {
             val controlChar = (upperChar.code - 'A'.code + 1).toChar()
