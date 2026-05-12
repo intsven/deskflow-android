@@ -27,6 +27,7 @@ package org.tfv.deskflow.ext
 import android.content.Context
 import android.hardware.display.DisplayManager
 import android.view.Display
+import android.view.WindowManager
 import org.tfv.deskflow.client.models.Size
 import org.tfv.deskflow.client.models.SizeF
 
@@ -39,19 +40,26 @@ data class ScreenSize(val px: Size, val dp: SizeF, val scale: Float)
  * @return ScreenSize containing pixel dimensions, dp dimensions, and scale factor.
  */
 fun Context.getScreenSize(displayId: Int? = null): ScreenSize {
-    val displayContext = if (displayId != null) {
-        val displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
-        val display = displayManager.getDisplay(displayId) ?: this.display!!
-        createDisplayContext(display)
+    val displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+    
+    val display = if (displayId != null) {
+        displayManager.getDisplay(displayId) ?: run {
+            try { this.display } catch (e: Exception) { null } ?: displayManager.getDisplay(Display.DEFAULT_DISPLAY)
+        }
     } else {
-        this
+        try { this.display } catch (e: Exception) { null } ?: displayManager.getDisplay(Display.DEFAULT_DISPLAY)
     }
 
-    // Now use resources.displayMetrics from the correct context
-    val dm = displayContext.resources.displayMetrics
-    val widthPx = dm.widthPixels
-    val heightPx = dm.heightPixels
-    val widthDp = widthPx / dm.density
-    val heightDp = heightPx / dm.density
-    return ScreenSize(Size(widthPx, heightPx), SizeF(widthDp, heightDp), widthPx.toFloat() / widthDp)
+    val displayContext = createDisplayContext(display!!)
+    val wm = displayContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+    val metrics = wm.maximumWindowMetrics
+    val bounds = metrics.bounds
+
+    val widthPx = bounds.width()
+    val heightPx = bounds.height()
+    val density = displayContext.resources.displayMetrics.density
+    val widthDp = widthPx / density
+    val heightDp = heightPx / density
+
+    return ScreenSize(Size(widthPx, heightPx), SizeF(widthDp, heightDp), density)
 }
