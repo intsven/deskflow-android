@@ -187,8 +187,16 @@ class FullDuplexSocket(
     // Enqueue the next message
     outbound.put(ByteBuffer.wrap(data))
 
-    // Wake up selector in case it's blocked
+    // Wake up selector and ensure OP_WRITE is registered
     try {
+      val sel = selector
+      val ch = channel
+      if (sel != null && ch != null) {
+        val key = ch.keyFor(sel)
+        if (key != null && key.isValid) {
+          key.interestOps(key.interestOps() or SelectionKey.OP_WRITE)
+        }
+      }
       selector?.wakeup()
     } catch (_: Exception) {}
 
@@ -489,6 +497,10 @@ class FullDuplexSocket(
                   ) {
                     doHandshake(sc, sel)
                   }
+                } else {
+                  try {
+                    key.interestOps(key.interestOps() and SelectionKey.OP_WRITE.inv())
+                  } catch (_: Exception) {}
                 }
               } else { // Drain one message at a time
                 val msg = outbound.poll()
@@ -499,6 +511,10 @@ class FullDuplexSocket(
                   if (msg.hasRemaining()) {
                     outbound.put(msg)
                   }
+                } else {
+                  try {
+                    key.interestOps(key.interestOps() and SelectionKey.OP_WRITE.inv())
+                  } catch (_: Exception) {}
                 }
               }
             }

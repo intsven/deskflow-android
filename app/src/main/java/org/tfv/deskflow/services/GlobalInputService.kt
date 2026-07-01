@@ -175,11 +175,13 @@ class GlobalInputService : AccessibilityService() {
     object : GestureResultCallback() {
       override fun onCompleted(gestureDescription: GestureDescription) {
         super.onCompleted(gestureDescription)
+        log.debug { "Gesture COMPLETED successfully" }
         globalInputPending = false
       }
 
       override fun onCancelled(gestureDescription: GestureDescription) {
         super.onCancelled(gestureDescription)
+        log.warn { "Gesture CANCELLED by system" }
         globalInputPending = false
       }
     }
@@ -677,6 +679,14 @@ class GlobalInputService : AccessibilityService() {
           }
           withContext(Dispatchers.Main) {
             hideMousePointer()
+            // Reset stale drag/click state when cursor leaves to prevent
+            // leftover activeDragState from blocking future speculative holds
+            if (activeDragState != null) {
+              log.info { "Clearing stale activeDragState on cursor leave" }
+              activeDragState = null
+              dragGestureInProgress = false
+              mouseButtonDown = null
+            }
           }
           releaseWifiLowLatencyLock()
         }
@@ -886,19 +896,21 @@ class GlobalInputService : AccessibilityService() {
 
       log.debug { "Selecting active display from ${displays.size} available display(s)" }
 
-      // Single display - use it
-      if (displays.size == 1) {
-        return displays[0]
+      // Prefer the default display (e.g., the main physical screen)
+      val defaultDisplay = displayManager.getDisplay(android.view.Display.DEFAULT_DISPLAY)
+      if (defaultDisplay != null && defaultDisplay.state != android.view.Display.STATE_OFF) {
+        log.info { "Using default display: ${defaultDisplay.displayId} (${defaultDisplay.name})" }
+        return defaultDisplay
       }
 
-      // Multiple displays - use the one with the largest display ID
-      val activeDisplay = displays.maxByOrNull { it.displayId }!!
-      log.info { "Using display with largest ID: ${activeDisplay.displayId} (${activeDisplay.name})" }
+      // Fallback: use the first available display that is ON
+      val activeDisplay = displays.firstOrNull { it.state == android.view.Display.STATE_ON } ?: displays[0]
+      log.info { "Using fallback display: ${activeDisplay.displayId} (${activeDisplay.name})" }
       return activeDisplay
 
     } catch (err: Exception) {
-      log.error(err) { "Error selecting display, using first display" }
-      return displayManager.displays[0]
+      log.error(err) { "Error selecting display, using default display" }
+      return displayManager.getDisplay(android.view.Display.DEFAULT_DISPLAY) ?: displayManager.displays[0]
     }
   }
 
@@ -917,7 +929,7 @@ class GlobalInputService : AccessibilityService() {
     y: Float = mousePointerLayout.y.toFloat(),
     duration: Long = 100,
   ) {
-    log.info { "Tap gesture at [$x, $y] with duration ${duration}ms" }
+    log.debug { "Tap gesture at [$x, $y] with duration ${duration}ms, displayId=$activeDisplayId" }
 
     val path = Path().apply { moveTo(x, y) }
     val gesture =
@@ -925,7 +937,69 @@ class GlobalInputService : AccessibilityService() {
         .setDisplayId(activeDisplayId)
         .addStroke(StrokeDescription(path, 0, duration))
         .build()
-    dispatchGesture(gesture, gestureResultCallback, globalInputHandler)
+    val dispatched = dispatchGesture(gesture, gestureResultCallback, globalInputHandler)
+    log.debug { "dispatchGesture returned: $dispatched for tap at [$x, $y]" }
+
+    if (!dispatched) {
+      log.warn { "dispatchGesture failed, trying fallback click at node at [$x, $y]" }
+      tryClickNodeAtPosition(x, y)
+    }
+  }
+
+  /**
+   * Fallback: try to click the accessibility node at the given screen position.
+   * Used when dispatchGesture() fails to inject touch events.
+   */
+  private fun tryClickNodeAtPosition(x: Float, y: Float) {
+    try {
+      val rootNode = rootInActiveWindow ?: run {
+        log.warn { "Fallback click failed: no root window" }
+        return
+      }
+      val rect = Rect()
+      rootNode.getBoundsInScreen(rect)
+      log.debug { "Root window bounds: $rect, target: [$x, $y]" }
+
+      // Try performing ACTION_CLICK on the focused node first
+      val focusedNode = findFocus(FOCUS_INPUT)
+      if (focusedNode != null) {
+        log.debug { "Trying focused node click: ${focusedNode.className}" }
+        val result = focusedNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        log.debug { "Focused node click result: $result" }
+        if (result) return
+      }
+
+      // Try to find and click a node at the target position
+      val targetNode = findNodeAtPosition(rootNode, x.toInt(), y.toInt())
+      if (targetNode != null) {
+        log.debug { "Found node at position: ${targetNode.className}" }
+        val result = targetNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        log.debug { "Node click result: $result" }
+      } else {
+        log.warn { "No node found at position [$x, $y]" }
+      }
+    } catch (e: Exception) {
+      log.error(e) { "Fallback click failed" }
+    }
+  }
+
+  /**
+   * Recursively find an accessibility node at the given screen coordinates.
+   */
+  private fun findNodeAtPosition(node: AccessibilityNodeInfo, x: Int, y: Int): AccessibilityNodeInfo? {
+    val rect = Rect()
+    node.getBoundsInScreen(rect)
+    if (rect.contains(x, y)) {
+      // Check children first (more specific)
+      for (i in 0 until node.childCount) {
+        val child = node.getChild(i) ?: continue
+        val found = findNodeAtPosition(child, x, y)
+        if (found != null) return found
+      }
+      // If no child matched, this node is the best match
+      if (node.isClickable) return node
+    }
+    return null
   }
 
   /**
@@ -987,9 +1061,9 @@ class GlobalInputService : AccessibilityService() {
     )
     activeDragState = dragState
 
-    dispatchGesture(gesture, object : GestureResultCallback() {
+    val dispatched = dispatchGesture(gesture, object : GestureResultCallback() {
       override fun onCompleted(gestureDescription: GestureDescription) {
-        log.debug { "Speculative hold gesture dispatched successfully ($clampedFingerCount finger(s))" }
+        log.debug { "Speculative hold COMPLETED ($clampedFingerCount finger(s)) at [$x, $y]" }
         dragGestureInProgress = false
         // With willContinue=true, this will complete almost immediately (~20ms)
         // The drag state remains active - we're waiting for either:
@@ -1005,11 +1079,12 @@ class GlobalInputService : AccessibilityService() {
       }
 
       override fun onCancelled(gestureDescription: GestureDescription) {
-        log.warn { "Speculative hold cancelled" }
+        log.warn { "Speculative hold CANCELLED at [$x, $y] - clearing activeDragState" }
         activeDragState = null
         dragGestureInProgress = false
       }
     }, globalInputHandler)
+    log.debug { "Speculative hold dispatchGesture returned: $dispatched for [$x, $y] display=$activeDisplayId" }
   }
 
   /**
@@ -1194,19 +1269,20 @@ class GlobalInputService : AccessibilityService() {
 
     val gesture = gestureBuilder.build()
 
-    dispatchGesture(gesture, object : GestureResultCallback() {
+    val dispatched = dispatchGesture(gesture, object : GestureResultCallback() {
       override fun onCompleted(gestureDescription: GestureDescription) {
-        log.debug { "Drag end gesture completed" }
+        log.debug { "Drag end gesture COMPLETED at [$endX, $endY]" }
         activeDragState = null
         dragGestureInProgress = false
       }
 
       override fun onCancelled(gestureDescription: GestureDescription) {
-        log.warn { "Drag end gesture cancelled" }
+        log.warn { "Drag end gesture CANCELLED at [$endX, $endY]" }
         activeDragState = null
         dragGestureInProgress = false
       }
     }, globalInputHandler)
+    log.debug { "Drag end dispatchGesture returned: $dispatched" }
   }
 
   /**
@@ -1322,18 +1398,15 @@ class GlobalInputService : AccessibilityService() {
         )
         log.debug { "Mouse button down: id=${event.id}, pos=[${mousePointerLayout.x}, ${mousePointerLayout.y}]" }
 
-        // For left button (id=1), start a speculative hold gesture immediately
-        // This provides immediate feedback and can be converted to drag if mouse moves
+        // Start speculative hold to detect drag vs click.
+        // On mouse up, if no movement occurred, we dispatch a fresh tap gesture
+        // instead of using continueStroke (which causes pointer ID conflicts on Android 15).
         if (event.id.toInt() == 1) {
           startSpeculativeHold(mousePointerLayout.x.toFloat(), mousePointerLayout.y.toFloat())
         }
-
-        // For middle button (id=2), start a 3-finger speculative hold gesture immediately
         if (event.id.toInt() == 2) {
           startSpeculativeHold(mousePointerLayout.x.toFloat(), mousePointerLayout.y.toFloat(), 3)
         }
-
-        // For right button (id=3), start a 2-finger speculative hold gesture immediately
         if (event.id.toInt() == 3) {
           startSpeculativeHold(mousePointerLayout.x.toFloat(), mousePointerLayout.y.toFloat(), 2)
         }
@@ -1357,13 +1430,17 @@ class GlobalInputService : AccessibilityService() {
             val clickDuration = buttonState?.let {
               System.currentTimeMillis() - it.downTime
             } ?: 100L
-            log.debug { "Ending speculative hold (no drag occurred) - will act as click with duration ${clickDuration}ms" }
+            log.debug { "Speculative hold click (no drag occurred) - dispatching fresh tap at [$currentX, $currentY] duration=${clickDuration}ms" }
 
-            // Clear button state now
+            // Clear button state and stale drag state
             mouseButtonDown = null
+            activeDragState = null
+            dragGestureInProgress = false
 
-            // End the drag gesture - will release the held touch
-            endDragGesture(currentX, currentY)
+            // Dispatch a fresh tap gesture instead of endDragGesture/continueStroke
+            // continueStroke causes "ACTION_MOVE touching pointers don't match" errors
+            // in InputDispatcher on Android 15, so we dispatch a clean new gesture
+            tapGesture(currentX, currentY, clickDuration)
             return
           } else {
             // This was an actual drag operation
@@ -1399,7 +1476,7 @@ class GlobalInputService : AccessibilityService() {
           }
           else -> {
             // Unknown buttons - default to normal click with actual duration
-            log.info { "Button $buttonId click (default) at [$currentX, $currentY] held for ${buttonDownDuration}ms" }
+            log.debug { "Button $buttonId click (default) at [$currentX, $currentY] held for ${buttonDownDuration}ms" }
             tapGesture(currentX, currentY, buttonDownDuration)
           }
         }
@@ -1859,6 +1936,23 @@ class GlobalInputService : AccessibilityService() {
     // Mark service as connected - now safe to add overlay windows
     isServiceConnected = true
     log.info { "Accessibility service connected, window overlays now available" }
+
+    // Check overlay permission health - on Android 15, the package-level grant can
+    // become stale (appops=allow but granted=false) which silently breaks dispatchGesture().
+    // A reboot typically fixes this. Log a clear warning if the permission is unhealthy.
+    val overlayGranted = android.provider.Settings.canDrawOverlays(this)
+    val appOpsAllowed = try {
+      val appOps = getSystemService(APP_OPS_SERVICE) as android.app.AppOpsManager
+      appOps.unsafeCheckOpNoThrow(
+        android.app.AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW,
+        android.os.Process.myUid(),
+        packageName
+      ) == android.app.AppOpsManager.MODE_ALLOWED
+    } catch (e: Exception) { false }
+    log.info { "Overlay permission check: canDrawOverlays=$overlayGranted, appOps=$appOpsAllowed" }
+    if (!overlayGranted || !appOpsAllowed) {
+      log.error { "OVERLAY PERMISSION ISSUE: canDrawOverlays=$overlayGranted, appOps=$appOpsAllowed. Mouse clicks will NOT work. Reboot or re-grant SYSTEM_ALERT_WINDOW to fix." }
+    }
 
     // Now that service is connected, initialize WindowManager for the active display
     val activeDisplay = getActiveDisplay()

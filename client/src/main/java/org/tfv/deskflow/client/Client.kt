@@ -112,7 +112,7 @@ class Client(
               }
             }
             isConnected || isConnecting -> {
-              log.info { "Socket is already connected or connecting" }
+              log.trace { "Socket is already connected or connecting" }
               // Check for handshake timeout
               if (isConnected && !ackReceived) {
                 val startTime = connectionStartTime
