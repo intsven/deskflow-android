@@ -1,5 +1,12 @@
 # Deskflow Android
 
+> **Fork notes (`intsven/deskflow-android`, branch `keyboard-mouse-fixes`):**
+> input fixes for Android 15 — mouse click failure from stale
+> `SYSTEM_ALERT_WINDOW` state, mouse-movement/screen-size handling via
+> maximum window metrics, keyboard (IME) input handling with relaxed
+> lifecycle check, plus a thread-safe event emitter (`CopyOnWriteArrayList`).
+> Upstream is `qvr/deskflow-android`.
+
 A **near** fully functional [Deskflow (deskflow.org)](https://deskflow.org) client for Android devices.
 
 > NOTE: Everything here in, assumes you already use Deskflow on your desktop &
