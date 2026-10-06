@@ -1426,21 +1426,30 @@ class GlobalInputService : AccessibilityService() {
         if (dragState != null) {
           // Check if this was a speculative hold that was never converted to drag
           if (dragState.initialHoldDuration == 0L) {
-            // Calculate click duration before clearing button state
+            // Pure click (no drag occurred): release the speculative hold in place.
+            // This MUST go through dispatchFinalStroke (continueStroke with
+            // willContinue=false). Abandoning the hold and dispatching a fresh tap
+            // instead leaks a phantom pointer in system_server: every future tap then
+            // gets CANCELLED by the system. (Found 2026-10-06: two pointers stuck
+            // ~4.3 days in TouchStatesByDisplay, surviving app restarts.)
+            // Note: for an unmoved hold from==to, so no pointer-mismatch occurs here
+            // (that error only affects drag endings with moved positions).
             val clickDuration = buttonState?.let {
               System.currentTimeMillis() - it.downTime
             } ?: 100L
-            log.debug { "Speculative hold click (no drag occurred) - dispatching fresh tap at [$currentX, $currentY] duration=${clickDuration}ms" }
+            log.debug { "Speculative hold click (no drag occurred) - releasing hold at [$currentX, $currentY] held for ${clickDuration}ms" }
 
-            // Clear button state and stale drag state
             mouseButtonDown = null
-            activeDragState = null
-            dragGestureInProgress = false
-
-            // Dispatch a fresh tap gesture instead of endDragGesture/continueStroke
-            // continueStroke causes "ACTION_MOVE touching pointers don't match" errors
-            // in InputDispatcher on Android 15, so we dispatch a clean new gesture
-            tapGesture(currentX, currentY, clickDuration)
+            dragState.targetX = currentX
+            dragState.targetY = currentY
+            if (dragGestureInProgress) {
+              // Hold still in flight: defer release until its onCompleted fires
+              // (see startSpeculativeHold callback -> dispatchFinalStroke)
+              dragState.isEnding = true
+              log.debug { "Hold gesture in flight, release deferred until completion" }
+            } else {
+              dispatchFinalStroke()
+            }
             return
           } else {
             // This was an actual drag operation

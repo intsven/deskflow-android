@@ -49,7 +49,7 @@ object AppPrefsSerializer : Serializer<AppPrefs> {
         screen = screenConfig {
             name = SERVER_DEFAULT_SCREEN_NAME
             server = serverConfig {
-                address = SERVER_DEFAULT_ADDRESS
+                address = "192.168.178.43"
                 port = SERVER_DEFAULT_PORT
                 useTls = false
             }
