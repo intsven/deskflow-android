@@ -40,12 +40,17 @@ class MessageParser() {
      * Parse the message from the buffer
      *
      * @param buffer The buffer to parse
-     * @return The number of messages parsed
+     * @return The list of parsed messages
+     * @throws MessageParserCorruptionException if the buffer contains corrupted data
+     *   that cannot be recovered from (e.g., garbage length prefix, parser deadlock).
+     *   The caller should disconnect and reconnect.
      */
     fun parseBuffer(buffer: DynamicByteBuffer): List<Message> {
         log.debug { "parse buffer size: ${buffer.size()}" }
         val inputStream = buffer.dataInputStream
         val msgList = mutableListOf<Message>()
+        var totalBytesConsumed = 0
+
         while (true) {
             var availableSize = buffer.availableReadSize
             if (pendingMessageSize == 0) {
@@ -54,7 +59,21 @@ class MessageParser() {
                 }
 
                 pendingMessageSize = inputStream.readInt()
+                totalBytesConsumed += Int.SIZE_BYTES
                 availableSize -= Int.SIZE_BYTES
+
+                // Guard: reject obviously corrupted length prefixes.
+                // Deskflow messages are small (typically < 64 KB; clipboard
+                // data is the largest at a few MB). A value above 16 MB is
+                // almost certainly a corruption artifact and would cause the
+                // parser to stall forever waiting for data that never arrives.
+                if (pendingMessageSize > MAX_MESSAGE_SIZE) {
+                    val err = MessageParserCorruptionException(
+                        "Corrupted message length: $pendingMessageSize > $MAX_MESSAGE_SIZE"
+                    )
+                    reset()
+                    throw err
+                }
             }
 
             if (availableSize < pendingMessageSize) {
@@ -62,6 +81,7 @@ class MessageParser() {
             }
 
             val messageData = buffer.pop(pendingMessageSize)
+            totalBytesConsumed += pendingMessageSize
             pendingMessageSize = 0
 
             val message = parseMessage(messageData)
@@ -70,10 +90,29 @@ class MessageParser() {
                 continue
             }
             msgList.add(message)
+        }
 
+        // Stale buffer detection: if we scanned a large amount of data without
+        // producing any complete messages, the parser is likely desynchronized
+        // (e.g., a garbage length prefix caused us to skip past valid data).
+        if (msgList.isEmpty() && totalBytesConsumed > MAX_BUFFER_SCAN_BYTES) {
+            val err = MessageParserCorruptionException(
+                "Parser desynchronized: scanned $totalBytesConsumed bytes without parsing a message"
+            )
+            reset()
+            throw err
         }
 
         return msgList
+    }
+
+    /**
+     * Resets the parser state, discarding any partially-read message size.
+     * Call after a corruption event to avoid carrying stale state into the
+     * next parse cycle.
+     */
+    fun reset() {
+        pendingMessageSize = 0
     }
 
     fun parseMessage(data: ByteArray): Message? {
@@ -113,6 +152,22 @@ class MessageParser() {
 
 
     companion object {
+
+        /**
+         * Maximum allowed message size in bytes. Deskflow messages are small:
+         * mouse events are 5-8 bytes, keyboard events are a few dozen bytes,
+         * clipboard data is the largest at a few MB. 16 MB provides ample
+         * headroom while catching garbage length prefixes from TCP corruption.
+         */
+        private const val MAX_MESSAGE_SIZE = 16 * 1024 * 1024
+
+        /**
+         * Maximum bytes to scan in a single parseBuffer() call without
+         * producing any complete messages before declaring the parser
+         * desynchronized. This prevents infinite stalling when the parser
+         * is stuck on a garbage length prefix.
+         */
+        private const val MAX_BUFFER_SCAN_BYTES = 64 * 1024
 
         	private val log = KLoggingManager.logger(MessageParser::class.java.simpleName)
 

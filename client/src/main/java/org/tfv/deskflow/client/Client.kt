@@ -284,10 +284,18 @@ class Client(
   private fun onReceiveEvent(event: FullDuplexSocket.SocketEvent.ReceiveEvent) {
     val buf = event.buf
     log.trace { "ReceiveEvent(size=${buf.size()})" }
-    val messages = messageParser.parseBuffer(buf)
-    log.trace { "Parsed ${messages.size} messages" }
-    if (messages.isNotEmpty()) {
-      ClientEventBus.emit(MessagesEvent(messages))
+    try {
+      val messages = messageParser.parseBuffer(buf)
+      log.trace { "Parsed ${messages.size} messages" }
+      if (messages.isNotEmpty()) {
+        ClientEventBus.emit(MessagesEvent(messages))
+      }
+    } catch (err: org.tfv.deskflow.client.io.MessageParserCorruptionException) {
+      log.error(err) { "Message parser corruption detected, reconnecting: ${err.message}" }
+      // Reset the buffer so stale data doesn't carry into the next session
+      buf.reset()
+      // Disconnect triggers automatic reconnection via scheduleConnectionCheck()
+      connectionExecutor.submit { disconnect() }
     }
   }
 
